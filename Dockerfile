@@ -29,14 +29,19 @@ ENV npm_config_devdir=/tmp/npm-devdir
 ENV PATH=/opt/go/bin:/opt/node/bin:/opt/java/bin:${PATH}
 RUN curl -sSL -o /tmp/gradle.zip https://services.gradle.org/distributions/gradle-5.6.4-bin.zip \
     && unzip -qq /tmp/gradle.zip -d /opt \
-    && mv /opt/gradle-5.6.4 /opt/gradle \
+    && mkdir -p /opt/gradle/bin \
+    && cd /opt/gradle/bin       \
+    && /opt/gradle-5.6.4/bin/gradle wrapper \
     && rm -f /tmp/gradle.zip \
+    && rm -rf /opt/gradle-5.6.4 \
+    && cd - \
     && curl -sSL https://downloads.apache.org/maven/maven-3/3.6.3/binaries/apache-maven-3.6.3-bin.tar.gz | tar xzf - -C /opt \
     && mv /opt/apache-maven-3.6.3 /opt/maven
 ENV PATH=/opt/gradle/bin:/opt/maven/bin:${PATH}
 ADD builders/java/pom.xml /opt/fabric-chaincode-java/
 RUN mkdir -p /opt/fabric \
-    && curl -sSL https://github.com/hyperledger/fabric/releases/download/v2.2.0/hyperledger-fabric-linux-amd64-2.2.0.tar.gz | tar xzf - -C /opt/fabric  \
+    && curl -sSL https://github.com/hyperledger/fabric/releases/download/v2.2.2/hyperledger-fabric-linux-amd64-2.2.2.tar.gz | tar xzf - -C /opt/fabric  \
+    && curl -sSL https://github.com/hyperledger/fabric-ca/releases/download/v1.4.9/hyperledger-fabric-ca-linux-amd64-1.4.9.tar.gz | tar xzf - -C /opt/fabric  \
     && cd /opt/fabric-chaincode-java \
     && mvn -q dependency:copy-dependencies -DoutputDirectory=/opt/fabric-chaincode-java/lib \
     && npm install --unsafe-perm -g fabric-shim@2.2.0 \
@@ -48,8 +53,8 @@ FROM base AS builder
 ADD . /tmp/microfab
 RUN cd /tmp/microfab \
     && mkdir -p /opt/microfab/bin /opt/microfab/data \
-    && chown ibp-user:root /opt/microfab/data \
-    && chmod 775 /opt/microfab/data \
+    && chgrp -R root /opt/microfab/data \
+    && chmod -R g=u /opt/microfab/data \
     && go build -o /opt/microfab/bin/microfabd cmd/microfabd/main.go \
     && cp -rf builders /opt/microfab/builders
 

@@ -15,25 +15,30 @@ import (
 
 // CouchDB represents a CouchDB instance.
 type CouchDB struct {
-	url *nurl.URL
+	internalURL *nurl.URL
+	externalURL *nurl.URL
 }
 
 // New creates a new CouchDB instance.
-func New(url string) (*CouchDB, error) {
-	parsedURL, err := nurl.Parse(url)
+func New(internalURL, externalURL string) (*CouchDB, error) {
+	parsedInternalURL, err := nurl.Parse(internalURL)
 	if err != nil {
 		return nil, err
 	}
-	return &CouchDB{url: parsedURL}, nil
+	parsedExternalURL, err := nurl.Parse(externalURL)
+	if err != nil {
+		return nil, err
+	}
+	return &CouchDB{internalURL: parsedInternalURL, externalURL: parsedExternalURL}, nil
 }
 
 // WaitFor waits for the CouchDB instance to start.
-func (c *CouchDB) WaitFor() error {
-	timeout := time.After(10 * time.Second)
+func (c *CouchDB) WaitFor(timeout time.Duration) error {
+	timeoutCh := time.After(timeout)
 	tick := time.Tick(250 * time.Millisecond)
 	for {
 		select {
-		case <-timeout:
+		case <-timeoutCh:
 			return errors.New("timeout whilst waiting for CouchDB to start")
 		case <-tick:
 			if c.hasStarted() {
@@ -43,8 +48,16 @@ func (c *CouchDB) WaitFor() error {
 	}
 }
 
+// URL returns the URL of the CouchDB.
+func (c *CouchDB) URL(internal bool) *url.URL {
+	if internal {
+		return c.internalURL
+	}
+	return c.externalURL
+}
+
 func (c *CouchDB) hasStarted() bool {
-	upURL := c.url.ResolveReference(&url.URL{Path: "/_up"}).String()
+	upURL := c.internalURL.ResolveReference(&url.URL{Path: "/_up"}).String()
 	resp, err := http.Get(upURL)
 	if err != nil {
 		return false

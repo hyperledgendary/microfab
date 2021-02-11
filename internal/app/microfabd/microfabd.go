@@ -5,8 +5,12 @@
 package microfabd
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"os"
 	"os/signal"
 	"path"
@@ -21,16 +25,22 @@ import (
 	"github.com/IBM-Blockchain/microfab/internal/pkg/channel"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/console"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/couchdb"
+	"github.com/IBM-Blockchain/microfab/internal/pkg/identity"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/orderer"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/organization"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/peer"
 	"github.com/IBM-Blockchain/microfab/internal/pkg/proxy"
+	"github.com/IBM-Blockchain/microfab/internal/pkg/util"
+	"github.com/IBM-Blockchain/microfab/pkg/client"
 	"github.com/hyperledger/fabric-protos-go/common"
 	"golang.org/x/net/context"
 	"golang.org/x/sync/errgroup"
 )
 
 var logger = log.New(os.Stdout, fmt.Sprintf("[%16s] ", "microfabd"), log.LstdFlags)
+
+const startPort = 2000
+const endPort = 3000
 
 // Microfab represents an instance of the Microfab application.
 type Microfab struct {
@@ -39,11 +49,11 @@ type Microfab struct {
 	done                   chan struct{}
 	started                bool
 	config                 *Config
+	state                  *State
 	ordererOrganization    *organization.Organization
 	endorsingOrganizations []*organization.Organization
 	organizations          []*organization.Organization
 	orderer                *orderer.Orderer
-	ordererConnection      *orderer.Connection
 	couchDB                *couchdb.CouchDB
 	couchDBProxies         []*couchdb.Proxy
 	peers                  []*peer.Peer
@@ -52,6 +62,13 @@ type Microfab struct {
 	genesisBlocks          map[string]*common.Block
 	console                *console.Console
 	proxy                  *proxy.Proxy
+	currentPort            int
+}
+
+// State represents the state that should be persisted between instances.
+type State struct {
+	Hash []byte                      `json:"hash"`
+	CAS  map[string]*client.Identity `json:"cas"`
 }
 
 // New creates an instance of the Microfab application.
@@ -61,10 +78,11 @@ func New() (*Microfab, error) {
 		return nil, err
 	}
 	return &Microfab{
-		config:  config,
-		sigs:    make(chan os.Signal, 1),
-		done:    make(chan struct{}, 1),
-		started: false,
+		config:      config,
+		sigs:        make(chan os.Signal, 1),
+		done:        make(chan struct{}, 1),
+		started:     false,
+		currentPort: startPort,
 	}, nil
 }
 
@@ -82,10 +100,31 @@ func (m *Microfab) Start() error {
 		}
 	}()
 
-	// Ensure the directory exists and is empty.
-	err := m.ensureDirectory()
+	// Calculate the config hash.
+	config, err := json.Marshal(m.config)
 	if err != nil {
 		return err
+	}
+	hash := sha256.Sum256(config)
+
+	// See if the state exists.
+	if m.stateExists() {
+		if temp, err := m.loadState(); err != nil {
+			logger.Printf("Could not load state: %v\n", err)
+		} else if bytes.Equal(hash[:], temp.Hash) {
+			logger.Println("Loaded state")
+			m.state = temp
+		} else {
+			logger.Println("Config has changed, loaded state is invalid")
+		}
+	}
+
+	// Ensure the directory exists and is empty.
+	if m.state == nil {
+		err = m.ensureDirectory()
+		if err != nil {
+			return err
+		}
 	}
 
 	// Create all of the organizations.
@@ -122,25 +161,27 @@ func (m *Microfab) Start() error {
 
 	// Create and start all of the components (orderer, peers, CAs).
 	eg.Go(func() error {
-		return m.createAndStartOrderer(m.ordererOrganization, 7050, 7051)
+		apiPort := m.allocatePort()
+		operationsPort := m.allocatePort()
+		return m.createAndStartOrderer(m.ordererOrganization, apiPort, operationsPort)
 	})
 	for i := range m.endorsingOrganizations {
 		organization := m.endorsingOrganizations[i]
-		numPorts := 6
-		peerAPIPort := 7052 + (i * numPorts)
-		peerChaincodePort := 7053 + (i * numPorts)
-		peerOperationsPort := 7054 + (i * numPorts)
-		couchDBProxyPort := 7055 + (i * numPorts)
-		caAPIPort := 7056 + (i * numPorts)
-		caOperationsPort := 7057 + (i * numPorts)
-		if m.config.CouchDB {
-			go m.createAndStartCouchDBProxy(organization, couchDBProxyPort)
-		}
 		eg.Go(func() error {
-			return m.createAndStartPeer(organization, peerAPIPort, peerChaincodePort, peerOperationsPort, m.config.CouchDB, couchDBProxyPort)
+			peerAPIPort := m.allocatePort()
+			peerChaincodePort := m.allocatePort()
+			peerOperationsPort := m.allocatePort()
+			if m.config.CouchDB {
+				couchDBProxyPort := m.allocatePort()
+				go m.createAndStartCouchDBProxy(organization, couchDBProxyPort)
+				return m.createAndStartPeer(organization, peerAPIPort, peerChaincodePort, peerOperationsPort, m.config.CouchDB, couchDBProxyPort)
+			}
+			return m.createAndStartPeer(organization, peerAPIPort, peerChaincodePort, peerOperationsPort, false, 0)
 		})
 		if m.config.CertificateAuthorities {
 			eg.Go(func() error {
+				caAPIPort := m.allocatePort()
+				caOperationsPort := m.allocatePort()
 				return m.createAndStartCA(organization, caAPIPort, caOperationsPort)
 			})
 		}
@@ -156,7 +197,8 @@ func (m *Microfab) Start() error {
 	})
 
 	// Create and start the console.
-	console, err := console.New(m.organizations, m.orderer, m.peers, m.cas, 8081, fmt.Sprintf("http://console.%s:%d", m.config.Domain, m.config.Port))
+	consolePort := m.allocatePort()
+	console, err := console.New(m.organizations, m.orderer, m.peers, m.cas, consolePort, fmt.Sprintf("http://console.%s:%d", m.config.Domain, m.config.Port))
 	if err != nil {
 		return err
 	}
@@ -164,7 +206,7 @@ func (m *Microfab) Start() error {
 	go console.Start()
 
 	// Create and start the proxy.
-	proxy, err := proxy.New(console, m.orderer, m.peers, m.cas, m.config.Port)
+	proxy, err := proxy.New(console, m.orderer, m.peers, m.cas, m.couchDB, m.config.Port)
 	if err != nil {
 		return err
 	}
@@ -172,13 +214,6 @@ func (m *Microfab) Start() error {
 	go proxy.Start()
 
 	// Connect to all of the components.
-	channelCreator := m.endorsingOrganizations[0]
-	ordererConnection, err := orderer.Connect(m.orderer, channelCreator.MSPID(), channelCreator.Admin())
-	if err != nil {
-		return err
-	}
-	m.ordererConnection = ordererConnection
-	defer m.ordererConnection.Close()
 	for _, p := range m.peers {
 		peerConnection, err := peer.Connect(p, p.Organization().MSPID(), p.Organization().Admin())
 		if err != nil {
@@ -193,13 +228,21 @@ func (m *Microfab) Start() error {
 	}()
 
 	// Create and join all of the channels.
-	for i := range m.config.Channels {
-		channel := m.config.Channels[i]
-		eg.Go(func() error {
-			return m.createAndJoinChannel(channel)
-		})
+	if m.state == nil {
+		for i := range m.config.Channels {
+			channel := m.config.Channels[i]
+			eg.Go(func() error {
+				return m.createAndJoinChannel(channel)
+			})
+		}
+		err = eg.Wait()
+		if err != nil {
+			return err
+		}
 	}
-	err = eg.Wait()
+
+	// Write the state for next time.
+	err = m.saveState()
 	if err != nil {
 		return err
 	}
@@ -235,6 +278,17 @@ func (m *Microfab) Wait() {
 	if m.started {
 		<-m.done
 	}
+}
+
+func (m *Microfab) allocatePort() int {
+	m.Lock()
+	defer m.Unlock()
+	if m.currentPort >= endPort {
+		logger.Fatalf("Failed to allocate port, port range %d-%d exceeded", startPort, endPort)
+	}
+	result := m.currentPort
+	m.currentPort++
+	return result
 }
 
 func (m *Microfab) ensureDirectory() error {
@@ -282,28 +336,110 @@ func (m *Microfab) removeDirectory() error {
 	return nil
 }
 
+func (m *Microfab) stateExists() bool {
+	statePath := path.Join(m.config.Directory, "state.json")
+	if _, err := os.Stat(statePath); os.IsNotExist(err) {
+		return false
+	}
+	return true
+}
+
+func (m *Microfab) loadState() (*State, error) {
+	statePath := path.Join(m.config.Directory, "state.json")
+	file, err := os.Open(statePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	state := &State{}
+	err = json.NewDecoder(file).Decode(&state)
+	if err != nil {
+		return nil, err
+	}
+	return state, nil
+}
+
+func (m *Microfab) saveState() error {
+	statePath := path.Join(m.config.Directory, "state.json")
+	file, err := os.OpenFile(statePath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	config, err := json.Marshal(m.config)
+	if err != nil {
+		return err
+	}
+	hash := sha256.Sum256(config)
+	state := &State{
+		Hash: hash[:],
+		CAS:  map[string]*client.Identity{},
+	}
+	state.CAS[m.ordererOrganization.Name()] = m.ordererOrganization.CA().ToClient()
+	for _, endorsingOrganization := range m.endorsingOrganizations {
+		state.CAS[endorsingOrganization.Name()] = endorsingOrganization.CA().ToClient()
+	}
+	return json.NewEncoder(file).Encode(&state)
+}
+
 func (m *Microfab) createOrderingOrganization(config Organization) error {
 	logger.Printf("Creating ordering organization %s ...", config.Name)
-	organization, err := organization.New(config.Name)
+	var ca *identity.Identity
+	if m.state != nil {
+		temp, ok := m.state.CAS[config.Name]
+		if ok {
+			var err error
+			ca, err = identity.FromClient(temp)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	organization, err := organization.New(config.Name, ca)
+	if err != nil {
+		return err
+	}
+	organizationName := organization.Name()
+	lowerOrganizationName := strings.ToLower(organizationName)
+	adminDirectory := path.Join(m.config.Directory, fmt.Sprintf("admin-%s", lowerOrganizationName))
+	err = util.CreateMSPDirectory(adminDirectory, organization.Admin())
 	if err != nil {
 		return err
 	}
 	m.Lock()
-	defer m.Unlock()
 	m.ordererOrganization = organization
+	m.Unlock()
 	logger.Printf("Created ordering organization %s", config.Name)
 	return nil
 }
 
 func (m *Microfab) createEndorsingOrganization(config Organization) error {
 	logger.Printf("Creating endorsing organization %s ...", config.Name)
-	organization, err := organization.New(config.Name)
+	var ca *identity.Identity
+	if m.state != nil {
+		temp, ok := m.state.CAS[config.Name]
+		if ok {
+			var err error
+			ca, err = identity.FromClient(temp)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	organization, err := organization.New(config.Name, ca)
+	if err != nil {
+		return err
+	}
+	organizationName := organization.Name()
+	lowerOrganizationName := strings.ToLower(organizationName)
+	adminDirectory := path.Join(m.config.Directory, fmt.Sprintf("admin-%s", lowerOrganizationName))
+	err = util.CreateMSPDirectory(adminDirectory, organization.Admin())
 	if err != nil {
 		return err
 	}
 	m.Lock()
-	defer m.Unlock()
 	m.endorsingOrganizations = append(m.endorsingOrganizations, organization)
+	m.Unlock()
 	logger.Printf("Created endorsing organization %s", config.Name)
 	return nil
 }
@@ -322,30 +458,31 @@ func (m *Microfab) createAndStartOrderer(organization *organization.Organization
 	if err != nil {
 		return err
 	}
-	err = orderer.Start(m.endorsingOrganizations)
+	m.Lock()
+	m.orderer = orderer
+	m.Unlock()
+	err = orderer.Start(m.endorsingOrganizations, m.config.Timeout)
 	if err != nil {
 		return err
 	}
-	m.Lock()
-	defer m.Unlock()
-	m.orderer = orderer
 	logger.Printf("Created and started orderer for ordering organization %s", organization.Name())
 	return nil
 }
 
 func (m *Microfab) waitForCouchDB() error {
 	logger.Printf("Waiting for CouchDB to start ...")
-	couchDB, err := couchdb.New("http://localhost:5984")
-	if err != nil {
-		return err
-	}
-	err = couchDB.WaitFor()
+	couchURL := fmt.Sprintf("http://couchdb.%s:%d", m.config.Domain, m.config.Port)
+	couchDB, err := couchdb.New("http://localhost:5984", couchURL)
 	if err != nil {
 		return err
 	}
 	m.Lock()
-	defer m.Unlock()
 	m.couchDB = couchDB
+	m.Unlock()
+	err = couchDB.WaitFor(m.config.Timeout)
+	if err != nil {
+		return err
+	}
 	logger.Printf("CouchDB has started")
 	return nil
 }
@@ -357,13 +494,13 @@ func (m *Microfab) createAndStartCouchDBProxy(organization *organization.Organiz
 	if err != nil {
 		return err
 	}
+	m.Lock()
+	m.couchDBProxies = append(m.couchDBProxies, proxy)
+	m.Unlock()
 	err = proxy.Start()
 	if err != nil {
 		return err
 	}
-	m.Lock()
-	defer m.Unlock()
-	m.couchDBProxies = append(m.couchDBProxies, proxy)
 	logger.Printf("Created and started CouchDB proxy for endorsing organization %s", organization.Name())
 	return nil
 }
@@ -388,13 +525,13 @@ func (m *Microfab) createAndStartPeer(organization *organization.Organization, a
 	if err != nil {
 		return err
 	}
-	err = peer.Start()
+	m.Lock()
+	m.peers = append(m.peers, peer)
+	m.Unlock()
+	err = peer.Start(m.config.Timeout)
 	if err != nil {
 		return err
 	}
-	m.Lock()
-	defer m.Unlock()
-	m.peers = append(m.peers, peer)
 	logger.Printf("Created and started peer for endorsing organization %s", organization.Name())
 	return nil
 }
@@ -404,7 +541,7 @@ func (m *Microfab) createAndStartCA(organization *organization.Organization, api
 	organizationName := organization.Name()
 	lowerOrganizationName := strings.ToLower(organizationName)
 	caDirectory := path.Join(m.config.Directory, fmt.Sprintf("ca-%s", lowerOrganizationName))
-	ca, err := ca.New(
+	theCA, err := ca.New(
 		organization,
 		caDirectory,
 		int32(apiPort),
@@ -415,41 +552,64 @@ func (m *Microfab) createAndStartCA(organization *organization.Organization, api
 	if err != nil {
 		return err
 	}
-	err = ca.Start()
+	m.Lock()
+	m.cas = append(m.cas, theCA)
+	m.Unlock()
+	err = theCA.Start(m.config.Timeout)
 	if err != nil {
 		return err
 	}
-	m.Lock()
-	defer m.Unlock()
-	m.cas = append(m.cas, ca)
+	conn, err := ca.Connect(theCA)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	id, err := conn.Enroll(fmt.Sprintf("%s CA Admin", organizationName), "admin", "adminpw")
+	if err != nil {
+		return err
+	}
+	organization.SetCAAdmin(id)
 	logger.Printf("Created and started CA for endorsing organization %s", organization.Name())
 	return nil
 }
 
 func (m *Microfab) createChannel(config Channel) (*common.Block, error) {
 	logger.Printf("Creating channel %s ...", config.Name)
-	opts := []channel.Option{
-		channel.WithCapabilityLevel(m.config.CapabilityLevel),
+	capabilityLevel := config.CapabilityLevel
+	if capabilityLevel == "" {
+		capabilityLevel = m.config.CapabilityLevel
 	}
+	opts := []channel.Option{
+		channel.WithCapabilityLevel(capabilityLevel),
+	}
+	endorsingOrganizations := []*organization.Organization{}
 	for _, endorsingOrganization := range m.endorsingOrganizations {
-		found := false
 		for _, organizationName := range config.EndorsingOrganizations {
 			if endorsingOrganization.Name() == organizationName {
-				found = true
+				endorsingOrganizations = append(endorsingOrganizations, endorsingOrganization)
 				break
 			}
 		}
-		if found {
-			opts = append(opts, channel.AddMSPID(endorsingOrganization.MSPID()))
-		}
 	}
-	err := channel.CreateChannel(m.ordererConnection, config.Name, opts...)
+	if len(endorsingOrganizations) == 0 {
+		logger.Fatalf("Attempted to create channel %s with no endorsing organizations", config.Name)
+	}
+	for _, endorsingOrganization := range endorsingOrganizations {
+		opts = append(opts, channel.AddMSPID(endorsingOrganization.MSPID()))
+	}
+	channelCreator := endorsingOrganizations[rand.Intn(len(endorsingOrganizations))]
+	ordererConnection, err := orderer.Connect(m.orderer, channelCreator.MSPID(), channelCreator.Admin())
+	if err != nil {
+		return nil, err
+	}
+	defer ordererConnection.Close()
+	err = channel.CreateChannel(ordererConnection, config.Name, opts...)
 	if err != nil {
 		return nil, err
 	}
 	var genesisBlock *common.Block
 	for {
-		genesisBlock, err = blocks.GetGenesisBlock(m.ordererConnection, config.Name)
+		genesisBlock, err = blocks.GetGenesisBlock(ordererConnection, config.Name)
 		if err != nil {
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -469,7 +629,7 @@ func (m *Microfab) createChannel(config Channel) (*common.Block, error) {
 			opts = append(opts, channel.AddAnchorPeer(peer.MSPID(), peer.APIHostname(false), peer.APIPort(false)))
 		}
 	}
-	err = channel.UpdateChannel(m.ordererConnection, config.Name, opts...)
+	err = channel.UpdateChannel(ordererConnection, config.Name, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -530,6 +690,13 @@ func (m *Microfab) stop() error {
 		}
 		m.console = nil
 	}
+	for _, ca := range m.cas {
+		err := ca.Stop()
+		if err != nil {
+			return err
+		}
+	}
+	m.cas = []*ca.CA{}
 	for _, peer := range m.peers {
 		err := peer.Stop()
 		if err != nil {

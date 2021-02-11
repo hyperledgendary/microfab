@@ -55,6 +55,19 @@ type jsonOrderer struct {
 	Identity          string       `json:"identity"`
 }
 
+type jsonCA struct {
+	ID                string       `json:"id"`
+	DisplayName       string       `json:"display_name"`
+	Type              string       `json:"type"`
+	APIURL            string       `json:"api_url"`
+	APIOptions        *jsonOptions `json:"api_options"`
+	OperationsURL     string       `json:"operations_url"`
+	OperationsOptions *jsonOptions `json:"operations_options"`
+	MSPID             string       `json:"msp_id"`
+	Wallet            string       `json:"wallet"`
+	Identity          string       `json:"identity"`
+}
+
 type jsonIdentity struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
@@ -64,6 +77,7 @@ type jsonIdentity struct {
 	CA          []byte `json:"ca"`
 	MSPID       string `json:"msp_id"`
 	Wallet      string `json:"wallet"`
+	Hide        bool   `json:"hide"`
 }
 
 type components map[string]interface{}
@@ -75,27 +89,30 @@ type Console struct {
 	orderer          *orderer.Orderer
 	peers            []*peer.Peer
 	cas              []*ca.CA
-	port             int32
+	port             int
 	url              *url.URL
 }
 
 // New creates a new instance of a console.
-func New(organizations []*organization.Organization, orderer *orderer.Orderer, peers []*peer.Peer, cas []*ca.CA, port int32, curl string) (*Console, error) {
+func New(organizations []*organization.Organization, orderer *orderer.Orderer, peers []*peer.Peer, cas []*ca.CA, port int, curl string) (*Console, error) {
 	staticComponents := components{}
 	for _, organization := range organizations {
-		orgName := organization.Name()
-		lowerOrgName := strings.ToLower(orgName)
-		id := fmt.Sprintf("%sadmin", lowerOrgName)
-		admin := organization.Admin()
-		staticComponents[id] = &jsonIdentity{
-			ID:          id,
-			DisplayName: admin.Name(),
-			Type:        "identity",
-			Certificate: admin.Certificate().Bytes(),
-			PrivateKey:  admin.PrivateKey().Bytes(),
-			CA:          admin.CA().Bytes(),
-			MSPID:       organization.MSPID(),
-			Wallet:      organization.Name(),
+		orgHide := organization == orderer.Organization()
+		for _, identity := range organization.GetIdentities() {
+			identityHide := orgHide || identity != organization.Admin()
+			id := strings.ToLower(identity.Name())
+			id = strings.ReplaceAll(id, " ", "")
+			staticComponents[id] = &jsonIdentity{
+				ID:          id,
+				DisplayName: identity.Name(),
+				Type:        "identity",
+				Certificate: identity.Certificate().Bytes(),
+				PrivateKey:  identity.PrivateKey().Bytes(),
+				CA:          identity.CA().Bytes(),
+				MSPID:       organization.MSPID(),
+				Wallet:      organization.Name(),
+				Hide:        identityHide,
+			}
 		}
 	}
 	parsedURL, err := url.Parse(curl)
@@ -133,7 +150,7 @@ func (c *Console) Stop() error {
 }
 
 // Port returns the port of the console.
-func (c *Console) Port() int32 {
+func (c *Console) Port() int {
 	return c.port
 }
 
@@ -297,7 +314,7 @@ func (c *Console) getDynamicComponents(req *http.Request) components {
 		orgName := ca.Organization().Name()
 		lowerOrgName := strings.ToLower(orgName)
 		id := fmt.Sprintf("%sca", lowerOrgName)
-		dynamicComponents[id] = &jsonPeer{
+		dynamicComponents[id] = &jsonCA{
 			ID:          id,
 			DisplayName: fmt.Sprintf("%s CA", orgName),
 			Type:        "fabric-ca",
@@ -313,7 +330,8 @@ func (c *Console) getDynamicComponents(req *http.Request) components {
 				SSLTargetNameOverride: ca.OperationsHost(false),
 				RequestTimeout:        300 * 1000,
 			},
-			Identity: ca.Organization().Admin().Name(),
+			MSPID:    ca.Organization().MSPID(),
+			Identity: ca.Organization().CAAdmin().Name(),
 			Wallet:   ca.Organization().Name(),
 		}
 	}
